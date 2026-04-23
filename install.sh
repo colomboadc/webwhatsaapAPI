@@ -101,6 +101,8 @@ write_server_js() {
  *  - Baileys com fallback de versão (QR aparece mesmo sem internet/DNS momentâneo)
  *  - Botão/rota "Excluir Conta" (remove credenciais e mensagens da conta)
  *  - /api/send aceita GET (chat) e POST (opcional)
+ *  - Ignora mensagens vazias/eventos internos
+ *  - Salva wa_jid real para responder no contato correto
  */
 
 const express = require("express");
@@ -168,6 +170,18 @@ try {
   if (!cols.includes("role")) {
     db.prepare("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'user'").run();
   }
+} catch {}
+
+// Migração defensiva: salva JID real e nome do contato nas mensagens
+try {
+  const mcols = db.prepare("PRAGMA table_info(messages)").all().map(c => c.name);
+  if (!mcols.includes("wa_jid")) {
+    db.prepare("ALTER TABLE messages ADD COLUMN wa_jid TEXT").run();
+  }
+  if (!mcols.includes("push_name")) {
+    db.prepare("ALTER TABLE messages ADD COLUMN push_name TEXT").run();
+  }
+  db.prepare("CREATE INDEX IF NOT EXISTS idx_msg_wajid ON messages(account_id, wa_jid)").run();
 } catch {}
 
 // Utils
@@ -239,26 +253,84 @@ function setWebhook(user_id, url, secret){
 }
 
 // mensagens/threads
-function saveMessage({user_id, account_id, numero, direction, message, wa_id, ts}){
-  db.prepare("INSERT OR IGNORE INTO messages (user_id,account_id,numero,direction,message,wa_id,ts) VALUES (?,?,?,?,?,?,?)")
-    .run(user_id, account_id, numero, direction, message, wa_id||null, ts||Date.now());
+function saveMessage({user_id, account_id, numero, direction, message, wa_id, ts, wa_jid=null, push_name=null}){
+  const cleanMsg = String(message || "");
+  if(!cleanMsg.trim()) return;
+
+  try {
+    db.prepare("INSERT OR IGNORE INTO messages (user_id,account_id,numero,direction,message,wa_id,ts,wa_jid,push_name) VALUES (?,?,?,?,?,?,?,?,?)")
+      .run(user_id, account_id, numero, direction, cleanMsg, wa_id||null, ts||Date.now(), wa_jid||null, push_name||null);
+  } catch(e) {
+    db.prepare("INSERT OR IGNORE INTO messages (user_id,account_id,numero,direction,message,wa_id,ts) VALUES (?,?,?,?,?,?,?)")
+      .run(user_id, account_id, numero, direction, cleanMsg, wa_id||null, ts||Date.now());
+  }
 }
 function hasWaId(wa_id){
   if(!wa_id) return false;
   const row = db.prepare("SELECT 1 FROM messages WHERE wa_id=?").get(wa_id);
   return !!row;
 }
+function jidUser(jid){
+  return String(jid || "").split("@")[0].replace(/[^0-9]/g,"").replace(/^0+/,"");
+}
+
+function isPhoneJid(jid){
+  return String(jid || "").endsWith("@s.whatsapp.net");
+}
+
+function isLidJid(jid){
+  return String(jid || "").endsWith("@lid");
+}
+
+function getBestIncomingJid(m){
+  const k = m.key || {};
+  const candidates = [
+    k.remoteJidAlt,
+    k.participantAlt,
+    k.remoteJid,
+    k.participant,
+    m.participant
+  ].filter(Boolean).map(String);
+
+  const phone = candidates.find(isPhoneJid);
+  if(phone) return phone;
+
+  const lid = candidates.find(isLidJid);
+  if(lid) return lid;
+
+  return candidates[0] || "";
+}
+
+function getDisplayNumberFromJid(jid, pushName){
+  if(isPhoneJid(jid)) return jidUser(jid);
+  if(isLidJid(jid)) return jidUser(jid);
+  return jidUser(jid) || String(pushName || "contato");
+}
+
+function lookupReplyJid(account_id, numero){
+  const n = String(numero || "").replace(/[^0-9]/g,"").replace(/^0+/,"");
+  try {
+    const row = db.prepare(`
+      SELECT wa_jid FROM messages
+      WHERE account_id=? AND numero=? AND wa_jid IS NOT NULL AND TRIM(wa_jid) != ""
+      ORDER BY ts DESC LIMIT 1
+    `).get(account_id, n);
+    if(row && row.wa_jid) return row.wa_jid;
+  } catch {}
+  return "";
+}
+
 function listThreads(user, account_id, limit=200){
   if (user.role === "master") {
     return db.prepare(`
       SELECT numero, MAX(ts) as last_ts
-      FROM messages WHERE account_id=?
+      FROM messages WHERE account_id=? AND message IS NOT NULL AND TRIM(message) != ""
       GROUP BY numero ORDER BY last_ts DESC LIMIT ?`)
       .all(account_id, limit).map(r=>r.numero);
   }
   return db.prepare(`
     SELECT numero, MAX(ts) as last_ts
-    FROM messages WHERE user_id=? AND account_id=?
+    FROM messages WHERE user_id=? AND account_id=? AND message IS NOT NULL AND TRIM(message) != ""
     GROUP BY numero ORDER BY last_ts DESC LIMIT ?`)
     .all(user.id, account_id, limit).map(r=>r.numero);
 }
@@ -266,12 +338,12 @@ function getThread(user, account_id, numero, limit=800){
   if (user.role === "master") {
     return db.prepare(`
       SELECT numero, direction, message, ts
-      FROM messages WHERE account_id=? AND numero=?
+      FROM messages WHERE account_id=? AND numero=? AND message IS NOT NULL AND TRIM(message) != ""
       ORDER BY ts ASC LIMIT ?`).all(account_id, numero, limit);
   }
   return db.prepare(`
     SELECT numero, direction, message, ts
-    FROM messages WHERE user_id=? AND account_id=? AND numero=?
+    FROM messages WHERE user_id=? AND account_id=? AND numero=? AND message IS NOT NULL AND TRIM(message) != ""
     ORDER BY ts ASC LIMIT ?`).all(user.id, account_id, numero, limit);
 }
 
@@ -356,9 +428,15 @@ async function startWAForAccount(account){
     try{
       for(const m of (ev.messages||[])){
         if(!m || m.key?.fromMe) continue;
-        const jid = m.key?.remoteJid || "";
-        if(!jid || jid.endsWith("@g.us") || jid.endsWith("@broadcast")) continue;
-        const numero = String(jid.split("@")[0]).replace(/[^0-9]/g,"").replace(/^0+/,"");
+        const jidRaw = m.key?.remoteJid || "";
+        if(!jidRaw || jidRaw.endsWith("@g.us") || jidRaw.endsWith("@broadcast") || jidRaw.endsWith("@newsletter")) continue;
+
+        const wa_jid = getBestIncomingJid(m);
+        if(!wa_jid || wa_jid.endsWith("@g.us") || wa_jid.endsWith("@broadcast") || wa_jid.endsWith("@newsletter")) continue;
+
+        const push_name = m.pushName || "";
+        const numero = getDisplayNumberFromJid(wa_jid, push_name);
+
         const wa_id  = m.key?.id || null;
         const ts     = Number(m.messageTimestamp) * 1000 || Date.now();
         const msg = m.message || {};
@@ -371,9 +449,10 @@ async function startWAForAccount(account){
           || "";
 
         if(wa_id && hasWaId(wa_id)) continue; // DEDUPE
+        if(!String(texto || "").trim()) continue;
 
         const owner = getAccount(accId).user_id;
-        saveMessage({ user_id: owner, account_id: accId, numero, direction:"received", message:String(texto||""), wa_id, ts });
+        saveMessage({ user_id: owner, account_id: accId, numero, direction:"received", message:String(texto||""), wa_id, ts, wa_jid, push_name });
 
         io.to(room(accId)).emit("recv", { accId, numero, message: String(texto||""), ts, source:"baileys" });
         io.to(room(accId)).emit("threads-update", { accId, numero, ts });
@@ -394,17 +473,29 @@ async function startWAForAccount(account){
 }
 
 async function sendWhatsAppFromAccount(accId, numeroRaw, message){
-  const numero = String(numeroRaw||"").replace(/[^0-9]/g,"").replace(/^0+/,"");
+  const raw = String(numeroRaw||"").trim();
+  const numero = raw.replace(/[^0-9]/g,"").replace(/^0+/,"");
   if(!numero || !message) throw new Error("numero/mensagem inválidos");
+
   const acc = getAccount(accId); if(!acc) throw new Error("Conta inexistente");
   await startWAForAccount(acc);
+
   const sock = WA.sockets.get(accId);
   if(!sock || !WA.ready.get(accId)) throw new Error("WhatsApp não está pronto (abra /auth/"+accId+")");
-  await sock.sendMessage(`${numero}@s.whatsapp.net`, { text: String(message) });
+
+  let destinoJid = "";
+  if(raw.includes("@")) {
+    destinoJid = raw;
+  } else {
+    destinoJid = lookupReplyJid(accId, numero) || `${numero}@s.whatsapp.net`;
+  }
+
+  await sock.sendMessage(destinoJid, { text: String(message) });
+
   const owner = acc.user_id;
-  saveMessage({ user_id: owner, account_id: accId, numero, direction:"sent", message:String(message), wa_id:null, ts:Date.now() });
+  saveMessage({ user_id: owner, account_id: accId, numero, direction:"sent", message:String(message), wa_id:null, ts:Date.now(), wa_jid:destinoJid });
   io.to(room(accId)).emit("sent", { accId, numero, message: String(message), ts: Date.now() });
-  return { ok:true, accId, numero, driver:"baileys" };
+  return { ok:true, accId, numero, jid:destinoJid, driver:"baileys" };
 }
 
 function room(accId){ return `acc_${accId}`; }
@@ -429,10 +520,19 @@ body{
     radial-gradient(900px 500px at -10% 100%, rgba(34,211,238,.22) 0%, transparent 60%),
     linear-gradient(135deg,var(--bg0),var(--bg2));
 }
-.container{max-width:1200px;margin:24px auto;padding:0 16px}
+.container{width:min(1200px,100%);margin:24px auto;padding:0 16px}
 .card{background:linear-gradient(180deg,rgba(255,255,255,.08),rgba(255,255,255,.03));
       border:1px solid var(--line); border-radius:18px; backdrop-filter:blur(10px); box-shadow:0 20px 80px rgba(0,0,0,.45);
-      padding:18px;}
+      padding:18px;min-width:0;}
+.card>*{min-width:0}
+@media(max-width:700px){
+  .container{margin:12px auto;padding:0 10px}
+  .card{padding:14px;border-radius:14px}
+  h1{font-size:22px} h2{font-size:18px}
+  a.btn,button,.btn{width:100%;justify-content:center}
+  .topbar .wrap{flex-wrap:wrap}
+  .table th,.table td{white-space:nowrap}
+}
 h1,h2{letter-spacing:.2px} h1{font-size:28px;margin:0 0 10px;background:linear-gradient(90deg,var(--accent2),var(--accent),var(--accent3));-webkit-background-clip:text;-webkit-text-fill-color:transparent}
 a.btn,button,.btn{
   display:inline-flex;align-items:center;gap:8px; padding:10px 14px; border-radius:12px; border:1px solid var(--line);
@@ -790,6 +890,7 @@ const delBtn=document.getElementById("delBtn");
 
 function formatTime(ts){try{return new Date(ts||Date.now()).toLocaleTimeString()}catch{return ""}}
 function add(dir,txt,ts){
+  if(!String(txt || "").trim()) return;
   const b=document.createElement("div");
   b.className="bub "+(dir==="out"?"out":"in");
   b.innerHTML = "<div>"+(txt||"")+"</div><small>"+formatTime(ts)+"</small>";
@@ -856,13 +957,22 @@ app.get("/commands", requireAuth, (req, res) => {
   res.setHeader("Content-Type", "text/html; charset=utf-8");
   res.end(`<!doctype html><html><head>${head("Gerar Comandos — WhatsZvnColombo")}
 <style>
-  .grid{display:grid;grid-template-columns:1.1fr .9fr;gap:16px}
-  @media(max-width:980px){.grid{grid-template-columns:1fr}}
-  .code{position:relative;background:#0a142b;border:1px solid var(--line);border-radius:12px}
-  .code header{display:flex;justify-content:space-between;align-items:center;padding:8px 10px;border-bottom:1px solid var(--line)}
-  .code h3{margin:0;font-size:13px;color:#cde6ff}
-  pre{margin:0;padding:12px;white-space:pre;overflow:auto;font-family:ui-monospace, Menlo, Consolas, monospace;font-size:12.5px;line-height:1.45;color:#d9f1ff}
-  .btn.small{padding:7px 10px;font-weight:600}
+  .grid{display:grid;grid-template-columns:minmax(0,1.05fr) minmax(0,.95fr);gap:16px;align-items:start}
+  .formgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}
+  .actions-row{display:flex;gap:8px;margin-top:10px;align-items:center;flex-wrap:wrap}
+  .code{position:relative;background:#0a142b;border:1px solid var(--line);border-radius:12px;min-width:0;overflow:hidden}
+  .code header{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:8px 10px;border-bottom:1px solid var(--line)}
+  .code h3{margin:0;font-size:13px;color:#cde6ff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  pre{margin:0;padding:12px;white-space:pre-wrap;word-break:break-word;overflow:auto;font-family:ui-monospace, Menlo, Consolas, monospace;font-size:12.5px;line-height:1.45;color:#d9f1ff;max-height:260px}
+  .btn.small{padding:7px 10px;font-weight:600;width:auto;min-width:92px;justify-content:center}
+  textarea{resize:vertical;min-height:110px}
+  @media(max-width:980px){.grid{grid-template-columns:1fr}.formgrid{grid-template-columns:1fr}}
+  @media(max-width:620px){
+    .code header{flex-direction:column;align-items:stretch}
+    .btn.small{width:100%}
+    pre{font-size:11.5px;max-height:220px}
+    .actions-row button{width:100%}
+  }
 </style>
 </head><body>
 ${topbar()}
@@ -878,7 +988,7 @@ ${topbar()}
   <div class="grid">
     <div class="card">
       <h2 style="margin-top:0">Parâmetros</h2>
-      <div class="row" style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+      <div class="formgrid">
         <div>
           <label>Endpoint base (sem token)</label>
           <input id="baseUrl" value="${baseApi}">
@@ -889,7 +999,7 @@ ${topbar()}
         </div>
       </div>
 
-      <div class="row" style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+      <div class="formgrid">
         <div>
           <label>Conta (account)</label>
           <select id="account">
@@ -905,8 +1015,8 @@ ${topbar()}
       <label>Mensagem</label>
       <textarea id="message" rows="4">Olá! Mensagem de teste.</textarea>
 
-      <div style="display:flex;gap:8px;margin-top:10px">
-        <button class="btn" id="btnBuild">Gerar comandos</button>
+      <div class="actions-row">
+        <button class="btn" id="btnBuild" type="button">Gerar comandos</button>
         <span class="muted" id="status"></span>
       </div>
     </div>
@@ -963,28 +1073,60 @@ function codeRouterOS(url, body){
   return \`/tool fetch url="\${url}" \\\n    http-method=post \\\n    http-data="\${jEsc}" \\\n    http-header-field="Content-Type: application/json" \\\n    keep-result=no\`;
 }
 function setText(sel, t){ document.querySelector(sel).textContent = t; }
-function copyText(t){
-  navigator.clipboard.writeText(t).then(()=>{
-    const s=document.getElementById('status'); s.textContent='Copiado!'; setTimeout(()=>s.textContent='',1200);
-  }).catch(()=>alert('Falha ao copiar.'));
+function setStatus(msg, ms=1400){
+  const s=document.getElementById('status');
+  if(!s) return;
+  s.textContent=msg;
+  if(ms) setTimeout(()=>{ if(s.textContent===msg) s.textContent=''; }, ms);
 }
-document.querySelectorAll("[data-copy]").forEach(b=>{
-  b.addEventListener("click", ()=>{
-    const sel = b.getAttribute("data-copy");
-    copyText(document.querySelector(sel).textContent);
-  });
+async function copyText(t, btn){
+  const text = String(t || '').trim();
+  if(!text || text.startsWith('—')){ setStatus('Gere o comando primeiro.'); return; }
+  try{
+    if(navigator.clipboard && window.isSecureContext){
+      await navigator.clipboard.writeText(text);
+    }else{
+      const ta=document.createElement('textarea');
+      ta.value=text;
+      ta.setAttribute('readonly','');
+      ta.style.position='fixed';
+      ta.style.top='-1000px';
+      ta.style.left='-1000px';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      const ok=document.execCommand('copy');
+      document.body.removeChild(ta);
+      if(!ok) throw new Error('execCommand copy falhou');
+    }
+    const old = btn ? btn.textContent : '';
+    if(btn){ btn.textContent='Copiado ✓'; setTimeout(()=>btn.textContent=old, 1200); }
+    setStatus('Copiado!');
+  }catch(e){
+    setStatus('Não consegui copiar automaticamente. Selecione o texto e copie manualmente.', 3500);
+  }
+}
+document.querySelectorAll('[data-copy]').forEach(b=>{
+  b.setAttribute('role','button');
+  b.setAttribute('tabindex','0');
+  const run=()=>{
+    const sel = b.getAttribute('data-copy');
+    const el = document.querySelector(sel);
+    copyText(el ? el.textContent : '', b);
+  };
+  b.addEventListener('click', (ev)=>{ ev.preventDefault(); run(); });
+  b.addEventListener('keydown', (ev)=>{ if(ev.key==='Enter' || ev.key===' '){ ev.preventDefault(); run(); } });
 });
 document.getElementById("btnBuild").addEventListener("click", ()=>{
   const base = document.getElementById("baseUrl").value || ${JSON.stringify("http://localhost:3000/api/v1/")};
   const route = document.getElementById("route").value || "send";
   const url = buildUrl(base, USER_TOKEN, route);
   const body = payload();
-  if(!url || !body.account || !body.to || !body.message){ document.getElementById('status').textContent='Preencha account/to/message.'; return; }
+  if(!url || !body.account || !body.to || !body.message){ setStatus('Preencha account/to/message.', 2500); return; }
   setText("#outLinux", codeLinux(url, body));
   setText("#outWin",   codeWindows(url, body));
   setText("#outRB",    codeRouterOS(url, body));
-  document.getElementById('status').textContent='Comandos gerados.';
-  setTimeout(()=>document.getElementById('status').textContent='', 1200);
+  setStatus('Comandos gerados.');
 });
 </script>
 </body></html>`);
@@ -1176,8 +1318,10 @@ PY
 
 write_systemd_unit() {
   local rb_token cookie_secret
-  rb_token="$(random_alnum 28)"
-  cookie_secret="$(random_hex 32)"
+  rb_token="$(grep -E '^Environment=RB_TOKEN=' /etc/systemd/system/whatsweb.service 2>/dev/null | tail -n1 | cut -d= -f3- || true)"
+  cookie_secret="$(grep -E '^Environment=COOKIE_SECRET=' /etc/systemd/system/whatsweb.service 2>/dev/null | tail -n1 | cut -d= -f3- || true)"
+  [ -n "${rb_token}" ] || rb_token="$(random_alnum 28)"
+  [ -n "${cookie_secret}" ] || cookie_secret="$(random_hex 32)"
 
   mkdir -p "$(dirname "${LOG_FILE}")"
   touch "${LOG_FILE}"
@@ -1214,7 +1358,7 @@ EOF
 
 install_app_deps() {
   log "Instalando dependências do sistema..."
-  apt-get install -y --no-install-recommends     ca-certificates curl gnupg xz-utils build-essential python3 make g++     chrony ufw libsqlite3-dev pkg-config git
+  apt-get install -y --no-install-recommends     ca-certificates curl gnupg xz-utils build-essential python3 make g++     chrony ufw sqlite3 libsqlite3-dev pkg-config git
 
   log "Ajustando fuso horário e NTP..."
   timedatectl set-timezone "${TZ}" || true
@@ -1235,6 +1379,18 @@ install_app_deps() {
   log "Rebuild opcional do better-sqlite3..."
   npm rebuild better-sqlite3 --unsafe-perm || true
 }
+
+
+clean_database_messages() {
+  log "Corrigindo banco: removendo mensagens vazias e criando colunas wa_jid..."
+  if [ -f "${APP_DIR}/whatsweb.db" ]; then
+    sqlite3 "${APP_DIR}/whatsweb.db" "ALTER TABLE messages ADD COLUMN wa_jid TEXT;" 2>/dev/null || true
+    sqlite3 "${APP_DIR}/whatsweb.db" "ALTER TABLE messages ADD COLUMN push_name TEXT;" 2>/dev/null || true
+    sqlite3 "${APP_DIR}/whatsweb.db" "CREATE INDEX IF NOT EXISTS idx_msg_wajid ON messages(account_id, wa_jid);" 2>/dev/null || true
+    sqlite3 "${APP_DIR}/whatsweb.db" "DELETE FROM messages WHERE message IS NULL OR TRIM(message) = '';" 2>/dev/null || true
+  fi
+}
+
 
 show_summary() {
   local ip
@@ -1267,6 +1423,7 @@ main() {
   ensure_node
   install_app_deps
   write_server_js
+  clean_database_messages
   write_systemd_unit
 
   log "Liberando porta 3000 no firewall..."
