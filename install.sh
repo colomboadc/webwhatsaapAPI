@@ -1,63 +1,100 @@
-bash -c 'set -euo pipefail
+#!/usr/bin/env bash
+set -Eeuo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
-TZ="America/Sao_Paulo"
+TZ="${TZ:-America/Sao_Paulo}"
+APP_DIR="/opt/whatsweb"
+LOG_FILE="/var/log/whatsweb.log"
+NODE_VERSION="${NODE_VERSION:-v20.20.2}"
 
-echo ">>> 0) Parando serviço antigo (se existir) e liberando porta 3000..."
-systemctl stop whatsweb 2>/dev/null || true
-fuser -k 3000/tcp 2>/dev/null || true
+log() {
+  echo ">>> $*"
+}
 
-echo ">>> 1) Atualizando sistema e instalando dependências..."
-apt-get update -y
-apt-get upgrade -y
-# build-essential + libsqlite3-dev + pkg-config: evita erro do better-sqlite3
-apt-get install -y curl ca-certificates gnupg build-essential python3 make g++ chrony ufw libsqlite3-dev pkg-config git
+warn() {
+  echo ">>> [AVISO] $*" >&2
+}
 
-echo ">>> 2) Ajustando fuso horário e NTP..."
-timedatectl set-timezone "$TZ" || true
-systemctl enable --now chrony
-chronyc tracking || true
+die() {
+  echo ">>> [ERRO] $*" >&2
+  exit 1
+}
 
-echo ">>> 3) Instalando Node.js 20 LTS (com verificação)..."
-NEED_NODESOURCE=1
-if command -v node >/dev/null 2>&1; then
-  NV="$(node -v 2>/dev/null || echo v0.0.0)"
-  NV_MAJOR="${NV#v}"; NV_MAJOR="${NV_MAJOR%%.*}"
-  if [ "${NV_MAJOR:-0}" -ge 20 ] && command -v npm >/dev/null 2>&1; then
-    NEED_NODESOURCE=0
+cleanup_old_nodesource() {
+  rm -f /etc/apt/sources.list.d/nodesource.list         /etc/apt/sources.list.d/nodesource.sources         /etc/apt/preferences.d/nodejs         /etc/apt/keyrings/nodesource.gpg         /usr/share/keyrings/nodesource.gpg         /usr/share/keyrings/nodesource.gpg.key         /etc/apt/trusted.gpg.d/nodesource.gpg || true
+}
+
+apt_repair() {
+  dpkg --configure -a || true
+  apt-get -f install -y || true
+}
+
+apt_update_safe() {
+  if ! apt-get -o Acquire::Retries=3 update; then
+    warn "apt update falhou na primeira tentativa; tentando reparar dependências e limpando NodeSource antigo..."
+    apt_repair
+    cleanup_old_nodesource
+    apt-get -o Acquire::Retries=3 update
   fi
-fi
-if [ "$NEED_NODESOURCE" -eq 1 ]; then
+}
+
+detect_node_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64) echo "x64" ;;
+    aarch64|arm64) echo "arm64" ;;
+    armv7l|armv7) echo "armv7l" ;;
+    *)
+      die "Arquitetura não suportada automaticamente: $(uname -m)"
+      ;;
+  esac
+}
+
+install_node_official() {
+  local arch tmpdir node_dir tarball url
+  arch="$(detect_node_arch)"
+  tmpdir="$(mktemp -d)"
+  node_dir="/usr/local/lib/nodejs/node-${NODE_VERSION}-linux-${arch}"
+  tarball="node-${NODE_VERSION}-linux-${arch}.tar.xz"
+  url="https://nodejs.org/dist/${NODE_VERSION}/${tarball}"
+
+  log "Instalando Node.js oficial ${NODE_VERSION} para arquitetura ${arch}..."
+  rm -rf "${tmpdir}"
+  mkdir -p "${tmpdir}" /usr/local/lib/nodejs
+  curl -fsSL "${url}" -o "${tmpdir}/${tarball}"
+  tar -xJf "${tmpdir}/${tarball}" -C "${tmpdir}"
+  rm -rf "${node_dir}"
+  mv "${tmpdir}/node-${NODE_VERSION}-linux-${arch}" "${node_dir}"
+
+  ln -sfn "${node_dir}/bin/node" /usr/local/bin/node
+  ln -sfn "${node_dir}/bin/npm" /usr/local/bin/npm
+  ln -sfn "${node_dir}/bin/npx" /usr/local/bin/npx
+  [ -x "${node_dir}/bin/corepack" ] && ln -sfn "${node_dir}/bin/corepack" /usr/local/bin/corepack || true
+
+  rm -rf "${tmpdir}"
+}
+
+ensure_node() {
+  if command -v node >/dev/null 2>&1; then
+    local current
+    current="$(node -v 2>/dev/null || true)"
+    log "Node atual detectado: ${current:-desconhecido}"
+  fi
+
   apt-get purge -y nodejs npm || true
   apt-get autoremove -y || true
-  curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
-  apt-get install -y nodejs
-else
-  apt-get install -y npm || true
-fi
+  install_node_official
 
-echo ">>> Versões:"
-node -v
-npm -v
-npm config set fund false
-npm config set audit false
+  log "Versões instaladas:"
+  node -v
+  npm -v
 
-echo ">>> 4) Criando projeto WhatsWeb em /opt/whatsweb..."
-mkdir -p /opt/whatsweb
-cd /opt/whatsweb
-[ -f package.json ] || npm init -y >/dev/null
+  npm config set fund false --global || true
+  npm config set audit false --global || true
+}
 
-echo ">>> 4.0) Instalando pacotes Node (PIN em nanoid@3 — compatível com require)..."
-rm -rf node_modules package-lock.json
-export npm_config_build_from_source=true
-export npm_config_python=python3
-npm i @whiskeysockets/baileys socket.io express qrcode better-sqlite3 pino cors cookie-parser nanoid@3 axios --no-audit --no-fund
-
-echo ">>> 4.1) Rebuild opcional do better-sqlite3 (se necessário)..."
-npm rebuild better-sqlite3 --build-from-source --unsafe-perm || true
-
-echo ">>> 5) Gravando server.js (com correções de COOKIE_SECRET, fallback do Baileys e botão Excluir Conta)..."
-cat > /opt/whatsweb/server.js <<'"JS"'
+write_server_js() {
+  log "Gravando server.js..."
+  cat > "${APP_DIR}/server.js" <<'JS'
 /* WhatsWeb — multiusuário + multi-conta + webhook + API token + Gerador de Comandos
  * Correções:
  *  - COOKIE_SECRET fixo via ENV (sessões não caem após reboot)
@@ -1116,67 +1153,126 @@ io.on("connection", (socket)=>{
 // ===== Start HTTP =====
 const PORT = 3000;
 server.listen(PORT, ()=> log.info({PORT}, "HTTP on"));
-"JS"
+JS
+  sed -i 's/\r$//' "${APP_DIR}/server.js"
+}
 
-# garantir LF (evita CRLF)
-sed -i "s/\r$//" /opt/whatsweb/server.js
+random_alnum() {
+  python3 - "$1" <<'PY'
+import secrets, string, sys
+n = int(sys.argv[1])
+alphabet = string.ascii_letters + string.digits
+print(''.join(secrets.choice(alphabet) for _ in range(n)))
+PY
+}
 
-echo ">>> 6) Criando serviço systemd (com log em /var/log/whatsweb.log)..."
-RB_TOKEN="$(tr -dc A-Za-z0-9 </dev/urandom | head -c 28)"
-COOKIE_SECRET="$(tr -dc A-Fa-f0-9 </dev/urandom | head -c 64)"
-cat > /etc/systemd/system/whatsweb.service <<EOF
+random_hex() {
+  python3 - "$1" <<'PY'
+import secrets, sys
+n = int(sys.argv[1])
+print(secrets.token_hex(n))
+PY
+}
+
+write_systemd_unit() {
+  local rb_token cookie_secret
+  rb_token="$(random_alnum 28)"
+  cookie_secret="$(random_hex 32)"
+
+  mkdir -p "$(dirname "${LOG_FILE}")"
+  touch "${LOG_FILE}"
+
+  log "Criando serviço systemd..."
+  cat > /etc/systemd/system/whatsweb.service <<EOF
 [Unit]
 Description=WhatsWeb (Baileys + SQLite + Multiusuarios + Webhook + API + MASTER + RB)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
+Type=simple
 User=root
-WorkingDirectory=/opt/whatsweb
-ExecStart=/usr/bin/node --trace-uncaught /opt/whatsweb/server.js
-Restart=always
-RestartSec=2
+WorkingDirectory=${APP_DIR}
 Environment=NODE_ENV=production
-# >>>>>>>>>>>> DEFINA O MASTER AQUI <<<<<<<<<<<<
 Environment=MASTER_EMAIL=provedor@provedor
 Environment=MASTER_PASSWORD=provedor
-# Environment=MASTER_TOKEN=opcional_token_fixo
-# >>>>>>>>>>>> TOKEN FIXO P/ RB <<<<<<<<<<<<
-Environment=RB_TOKEN=${RB_TOKEN}
-# >>>>>>>>>>>> COOKIE SECRET FIXO (sessões persistentes) <<<<<<<<<<<<
-Environment=COOKIE_SECRET=${COOKIE_SECRET}
-StandardOutput=append:/var/log/whatsweb.log
-StandardError=append:/var/log/whatsweb.log
+Environment=RB_TOKEN=${rb_token}
+Environment=COOKIE_SECRET=${cookie_secret}
+ExecStart=/usr/bin/bash -lc 'exec /usr/local/bin/node --trace-uncaught ${APP_DIR}/server.js >> ${LOG_FILE} 2>&1'
+Restart=always
+RestartSec=2
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reload
-systemctl enable --now whatsweb
+  systemctl daemon-reload
+  systemctl enable --now whatsweb
 
-echo ">>> 7) Liberando porta 3000 no firewall..."
-ufw allow 3000/tcp || true
+  export RB_TOKEN_GENERATED="${rb_token}"
+}
 
-IP=$(hostname -I 2>/dev/null | awk "{print \$1}") || true
-[ -z "$IP" ] && IP="SEU_IP_DO_SERVIDOR"
+install_app_deps() {
+  log "Instalando dependências do sistema..."
+  apt-get install -y --no-install-recommends     ca-certificates curl gnupg xz-utils build-essential python3 make g++     chrony ufw libsqlite3-dev pkg-config git
 
-sleep 1
-echo "======================================================="
-echo "✅ WhatsWeb instalado (serviço: whatsweb)"
-echo "   Acesse:   http://$IP:3000/register   (cadastro com confirmação de senha)"
-echo "   Dashboard: http://$IP:3000/dashboard"
-echo "   Chat:      http://$IP:3000/chat/<ID_DA_CONTA>  (tem EXCLUIR CONTA e EXCLUIR CONVERSA)"
-echo "   RB_TOKEN:  $RB_TOKEN"
-echo "-------------------------------------------------------"
-echo "API padrão (JSON/Form): POST http://$IP:3000/api/v1/<TOKEN_DE_USUARIO>/send"
-echo "  {\"account\":ID,\"to\":\"5511...\",\"message\":\"Oi\"}"
-echo "API p/ Mikrotik (GET/POST, query/form/JSON, use RB_TOKEN ou TOKEN_DE_USUARIO no path):"
-echo "  http://$IP:3000/api/rb/$RB_TOKEN/send?account=1&to=5516999999999&message=Teste"
-echo "  *Obs: no Mikrotik, prefira POST JSON para acentos/espaços."
-echo "-------------------------------------------------------"
-systemctl --no-pager --full status whatsweb | sed -n "1,80p"
-echo "---------------- Últimas 80 linhas de log ----------------"
-tail -n 80 /var/log/whatsweb.log || true
-echo "======================================================="
-'
+  log "Ajustando fuso horário e NTP..."
+  timedatectl set-timezone "${TZ}" || true
+  systemctl enable --now chrony || true
+  chronyc tracking || true
+
+  mkdir -p "${APP_DIR}"
+  cd "${APP_DIR}"
+  [ -f package.json ] || npm init -y >/dev/null
+
+  log "Limpando instalação anterior do npm..."
+  rm -rf node_modules package-lock.json
+  npm cache clean --force >/dev/null 2>&1 || true
+
+  log "Instalando pacotes Node..."
+  npm install     @whiskeysockets/baileys     socket.io     express     qrcode     better-sqlite3     pino     cors     cookie-parser     nanoid@3     axios     --omit=dev     --no-audit     --no-fund
+
+  log "Rebuild opcional do better-sqlite3..."
+  npm rebuild better-sqlite3 --unsafe-perm || true
+}
+
+show_summary() {
+  local ip
+  ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+  [ -z "${ip}" ] && ip="SEU_IP_DO_SERVIDOR"
+
+  echo "======================================================="
+  echo "✅ WhatsWeb instalado/corrigido"
+  echo "   Register:  http://${ip}:3000/register"
+  echo "   Dashboard: http://${ip}:3000/dashboard"
+  echo "   RB_TOKEN:  ${RB_TOKEN_GENERATED:-não disponível}"
+  echo "-------------------------------------------------------"
+  systemctl --no-pager --full status whatsweb | sed -n '1,80p' || true
+  echo "---------------- Últimas 80 linhas de log ----------------"
+  tail -n 80 "${LOG_FILE}" || true
+  echo "======================================================="
+}
+
+main() {
+  log "Parando serviço antigo e liberando porta 3000..."
+  systemctl stop whatsweb 2>/dev/null || true
+  fuser -k 3000/tcp 2>/dev/null || true
+
+  log "Removendo repositório antigo da NodeSource, se existir..."
+  cleanup_old_nodesource
+
+  log "Atualizando índices do APT..."
+  apt_update_safe
+
+  ensure_node
+  install_app_deps
+  write_server_js
+  write_systemd_unit
+
+  log "Liberando porta 3000 no firewall..."
+  ufw allow 3000/tcp || true
+
+  show_summary
+}
+
+main "$@"
