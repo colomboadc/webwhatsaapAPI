@@ -101,8 +101,6 @@ write_server_js() {
  *  - Baileys com fallback de versão (QR aparece mesmo sem internet/DNS momentâneo)
  *  - Botão/rota "Excluir Conta" (remove credenciais e mensagens da conta)
  *  - /api/send aceita GET (chat) e POST (opcional)
- *  - Ignora mensagens vazias/eventos internos
- *  - Salva wa_jid real para responder no contato correto
  */
 
 const express = require("express");
@@ -170,18 +168,6 @@ try {
   if (!cols.includes("role")) {
     db.prepare("ALTER TABLE users ADD COLUMN role TEXT DEFAULT 'user'").run();
   }
-} catch {}
-
-// Migração defensiva: salva JID real e nome do contato nas mensagens
-try {
-  const mcols = db.prepare("PRAGMA table_info(messages)").all().map(c => c.name);
-  if (!mcols.includes("wa_jid")) {
-    db.prepare("ALTER TABLE messages ADD COLUMN wa_jid TEXT").run();
-  }
-  if (!mcols.includes("push_name")) {
-    db.prepare("ALTER TABLE messages ADD COLUMN push_name TEXT").run();
-  }
-  db.prepare("CREATE INDEX IF NOT EXISTS idx_msg_wajid ON messages(account_id, wa_jid)").run();
 } catch {}
 
 // Utils
@@ -253,84 +239,26 @@ function setWebhook(user_id, url, secret){
 }
 
 // mensagens/threads
-function saveMessage({user_id, account_id, numero, direction, message, wa_id, ts, wa_jid=null, push_name=null}){
-  const cleanMsg = String(message || "");
-  if(!cleanMsg.trim()) return;
-
-  try {
-    db.prepare("INSERT OR IGNORE INTO messages (user_id,account_id,numero,direction,message,wa_id,ts,wa_jid,push_name) VALUES (?,?,?,?,?,?,?,?,?)")
-      .run(user_id, account_id, numero, direction, cleanMsg, wa_id||null, ts||Date.now(), wa_jid||null, push_name||null);
-  } catch(e) {
-    db.prepare("INSERT OR IGNORE INTO messages (user_id,account_id,numero,direction,message,wa_id,ts) VALUES (?,?,?,?,?,?,?)")
-      .run(user_id, account_id, numero, direction, cleanMsg, wa_id||null, ts||Date.now());
-  }
+function saveMessage({user_id, account_id, numero, direction, message, wa_id, ts}){
+  db.prepare("INSERT OR IGNORE INTO messages (user_id,account_id,numero,direction,message,wa_id,ts) VALUES (?,?,?,?,?,?,?)")
+    .run(user_id, account_id, numero, direction, message, wa_id||null, ts||Date.now());
 }
 function hasWaId(wa_id){
   if(!wa_id) return false;
   const row = db.prepare("SELECT 1 FROM messages WHERE wa_id=?").get(wa_id);
   return !!row;
 }
-function jidUser(jid){
-  return String(jid || "").split("@")[0].replace(/[^0-9]/g,"").replace(/^0+/,"");
-}
-
-function isPhoneJid(jid){
-  return String(jid || "").endsWith("@s.whatsapp.net");
-}
-
-function isLidJid(jid){
-  return String(jid || "").endsWith("@lid");
-}
-
-function getBestIncomingJid(m){
-  const k = m.key || {};
-  const candidates = [
-    k.remoteJidAlt,
-    k.participantAlt,
-    k.remoteJid,
-    k.participant,
-    m.participant
-  ].filter(Boolean).map(String);
-
-  const phone = candidates.find(isPhoneJid);
-  if(phone) return phone;
-
-  const lid = candidates.find(isLidJid);
-  if(lid) return lid;
-
-  return candidates[0] || "";
-}
-
-function getDisplayNumberFromJid(jid, pushName){
-  if(isPhoneJid(jid)) return jidUser(jid);
-  if(isLidJid(jid)) return jidUser(jid);
-  return jidUser(jid) || String(pushName || "contato");
-}
-
-function lookupReplyJid(account_id, numero){
-  const n = String(numero || "").replace(/[^0-9]/g,"").replace(/^0+/,"");
-  try {
-    const row = db.prepare(`
-      SELECT wa_jid FROM messages
-      WHERE account_id=? AND numero=? AND wa_jid IS NOT NULL AND TRIM(wa_jid) != ""
-      ORDER BY ts DESC LIMIT 1
-    `).get(account_id, n);
-    if(row && row.wa_jid) return row.wa_jid;
-  } catch {}
-  return "";
-}
-
 function listThreads(user, account_id, limit=200){
   if (user.role === "master") {
     return db.prepare(`
       SELECT numero, MAX(ts) as last_ts
-      FROM messages WHERE account_id=? AND message IS NOT NULL AND TRIM(message) != ""
+      FROM messages WHERE account_id=?
       GROUP BY numero ORDER BY last_ts DESC LIMIT ?`)
       .all(account_id, limit).map(r=>r.numero);
   }
   return db.prepare(`
     SELECT numero, MAX(ts) as last_ts
-    FROM messages WHERE user_id=? AND account_id=? AND message IS NOT NULL AND TRIM(message) != ""
+    FROM messages WHERE user_id=? AND account_id=?
     GROUP BY numero ORDER BY last_ts DESC LIMIT ?`)
     .all(user.id, account_id, limit).map(r=>r.numero);
 }
@@ -338,12 +266,12 @@ function getThread(user, account_id, numero, limit=800){
   if (user.role === "master") {
     return db.prepare(`
       SELECT numero, direction, message, ts
-      FROM messages WHERE account_id=? AND numero=? AND message IS NOT NULL AND TRIM(message) != ""
+      FROM messages WHERE account_id=? AND numero=?
       ORDER BY ts ASC LIMIT ?`).all(account_id, numero, limit);
   }
   return db.prepare(`
     SELECT numero, direction, message, ts
-    FROM messages WHERE user_id=? AND account_id=? AND numero=? AND message IS NOT NULL AND TRIM(message) != ""
+    FROM messages WHERE user_id=? AND account_id=? AND numero=?
     ORDER BY ts ASC LIMIT ?`).all(user.id, account_id, numero, limit);
 }
 
@@ -428,15 +356,9 @@ async function startWAForAccount(account){
     try{
       for(const m of (ev.messages||[])){
         if(!m || m.key?.fromMe) continue;
-        const jidRaw = m.key?.remoteJid || "";
-        if(!jidRaw || jidRaw.endsWith("@g.us") || jidRaw.endsWith("@broadcast") || jidRaw.endsWith("@newsletter")) continue;
-
-        const wa_jid = getBestIncomingJid(m);
-        if(!wa_jid || wa_jid.endsWith("@g.us") || wa_jid.endsWith("@broadcast") || wa_jid.endsWith("@newsletter")) continue;
-
-        const push_name = m.pushName || "";
-        const numero = getDisplayNumberFromJid(wa_jid, push_name);
-
+        const jid = m.key?.remoteJid || "";
+        if(!jid || jid.endsWith("@g.us") || jid.endsWith("@broadcast")) continue;
+        const numero = String(jid.split("@")[0]).replace(/[^0-9]/g,"").replace(/^0+/,"");
         const wa_id  = m.key?.id || null;
         const ts     = Number(m.messageTimestamp) * 1000 || Date.now();
         const msg = m.message || {};
@@ -449,10 +371,9 @@ async function startWAForAccount(account){
           || "";
 
         if(wa_id && hasWaId(wa_id)) continue; // DEDUPE
-        if(!String(texto || "").trim()) continue;
 
         const owner = getAccount(accId).user_id;
-        saveMessage({ user_id: owner, account_id: accId, numero, direction:"received", message:String(texto||""), wa_id, ts, wa_jid, push_name });
+        saveMessage({ user_id: owner, account_id: accId, numero, direction:"received", message:String(texto||""), wa_id, ts });
 
         io.to(room(accId)).emit("recv", { accId, numero, message: String(texto||""), ts, source:"baileys" });
         io.to(room(accId)).emit("threads-update", { accId, numero, ts });
@@ -473,29 +394,17 @@ async function startWAForAccount(account){
 }
 
 async function sendWhatsAppFromAccount(accId, numeroRaw, message){
-  const raw = String(numeroRaw||"").trim();
-  const numero = raw.replace(/[^0-9]/g,"").replace(/^0+/,"");
+  const numero = String(numeroRaw||"").replace(/[^0-9]/g,"").replace(/^0+/,"");
   if(!numero || !message) throw new Error("numero/mensagem inválidos");
-
   const acc = getAccount(accId); if(!acc) throw new Error("Conta inexistente");
   await startWAForAccount(acc);
-
   const sock = WA.sockets.get(accId);
   if(!sock || !WA.ready.get(accId)) throw new Error("WhatsApp não está pronto (abra /auth/"+accId+")");
-
-  let destinoJid = "";
-  if(raw.includes("@")) {
-    destinoJid = raw;
-  } else {
-    destinoJid = lookupReplyJid(accId, numero) || `${numero}@s.whatsapp.net`;
-  }
-
-  await sock.sendMessage(destinoJid, { text: String(message) });
-
+  await sock.sendMessage(`${numero}@s.whatsapp.net`, { text: String(message) });
   const owner = acc.user_id;
-  saveMessage({ user_id: owner, account_id: accId, numero, direction:"sent", message:String(message), wa_id:null, ts:Date.now(), wa_jid:destinoJid });
+  saveMessage({ user_id: owner, account_id: accId, numero, direction:"sent", message:String(message), wa_id:null, ts:Date.now() });
   io.to(room(accId)).emit("sent", { accId, numero, message: String(message), ts: Date.now() });
-  return { ok:true, accId, numero, jid:destinoJid, driver:"baileys" };
+  return { ok:true, accId, numero, driver:"baileys" };
 }
 
 function room(accId){ return `acc_${accId}`; }
@@ -520,7 +429,7 @@ body{
     radial-gradient(900px 500px at -10% 100%, rgba(34,211,238,.22) 0%, transparent 60%),
     linear-gradient(135deg,var(--bg0),var(--bg2));
 }
-.container{width:min(1200px,100%);margin:24px auto;padding:0 16px}
+.container{width:min(1200px,100%);margin:24px auto;padding:0 16px)
 .card{background:linear-gradient(180deg,rgba(255,255,255,.08),rgba(255,255,255,.03));
       border:1px solid var(--line); border-radius:18px; backdrop-filter:blur(10px); box-shadow:0 20px 80px rgba(0,0,0,.45);
       padding:18px;min-width:0;}
@@ -890,7 +799,6 @@ const delBtn=document.getElementById("delBtn");
 
 function formatTime(ts){try{return new Date(ts||Date.now()).toLocaleTimeString()}catch{return ""}}
 function add(dir,txt,ts){
-  if(!String(txt || "").trim()) return;
   const b=document.createElement("div");
   b.className="bub "+(dir==="out"?"out":"in");
   b.innerHTML = "<div>"+(txt||"")+"</div><small>"+formatTime(ts)+"</small>";
@@ -1318,10 +1226,8 @@ PY
 
 write_systemd_unit() {
   local rb_token cookie_secret
-  rb_token="$(grep -E '^Environment=RB_TOKEN=' /etc/systemd/system/whatsweb.service 2>/dev/null | tail -n1 | cut -d= -f3- || true)"
-  cookie_secret="$(grep -E '^Environment=COOKIE_SECRET=' /etc/systemd/system/whatsweb.service 2>/dev/null | tail -n1 | cut -d= -f3- || true)"
-  [ -n "${rb_token}" ] || rb_token="$(random_alnum 28)"
-  [ -n "${cookie_secret}" ] || cookie_secret="$(random_hex 32)"
+  rb_token="$(random_alnum 28)"
+  cookie_secret="$(random_hex 32)"
 
   mkdir -p "$(dirname "${LOG_FILE}")"
   touch "${LOG_FILE}"
@@ -1358,7 +1264,7 @@ EOF
 
 install_app_deps() {
   log "Instalando dependências do sistema..."
-  apt-get install -y --no-install-recommends     ca-certificates curl gnupg xz-utils build-essential python3 make g++     chrony ufw sqlite3 libsqlite3-dev pkg-config git
+  apt-get install -y --no-install-recommends     ca-certificates curl gnupg xz-utils build-essential python3 make g++     chrony ufw libsqlite3-dev pkg-config git
 
   log "Ajustando fuso horário e NTP..."
   timedatectl set-timezone "${TZ}" || true
@@ -1379,18 +1285,6 @@ install_app_deps() {
   log "Rebuild opcional do better-sqlite3..."
   npm rebuild better-sqlite3 --unsafe-perm || true
 }
-
-
-clean_database_messages() {
-  log "Corrigindo banco: removendo mensagens vazias e criando colunas wa_jid..."
-  if [ -f "${APP_DIR}/whatsweb.db" ]; then
-    sqlite3 "${APP_DIR}/whatsweb.db" "ALTER TABLE messages ADD COLUMN wa_jid TEXT;" 2>/dev/null || true
-    sqlite3 "${APP_DIR}/whatsweb.db" "ALTER TABLE messages ADD COLUMN push_name TEXT;" 2>/dev/null || true
-    sqlite3 "${APP_DIR}/whatsweb.db" "CREATE INDEX IF NOT EXISTS idx_msg_wajid ON messages(account_id, wa_jid);" 2>/dev/null || true
-    sqlite3 "${APP_DIR}/whatsweb.db" "DELETE FROM messages WHERE message IS NULL OR TRIM(message) = '';" 2>/dev/null || true
-  fi
-}
-
 
 show_summary() {
   local ip
@@ -1423,7 +1317,6 @@ main() {
   ensure_node
   install_app_deps
   write_server_js
-  clean_database_messages
   write_systemd_unit
 
   log "Liberando porta 3000 no firewall..."
