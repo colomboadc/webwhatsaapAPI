@@ -24,3 +24,6 @@ Muito obrigado!
 <img width="900" height="1150" alt="image" src="https://github.com/user-attachments/assets/1166b48a-a03f-4373-82c7-b353d649c364" />
 
 
+ou em biticoin
+<img width="300" height="300" alt="image" src="https://github.com/user-attachments/assets/6f4056d9-e2e7-4b54-b361-2b9643f16705" />
+bc1qx4mtlyumqx38k0kls6zjdkx6w7e2mdwwfcyvla
